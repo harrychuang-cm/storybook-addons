@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { createElement } from "react";
 
+import "./figma-code-exporter.css";
 import { FigmaCodeExporter } from "./FigmaCodeExporter";
 import {
   defaultFigmaExportGlobalName,

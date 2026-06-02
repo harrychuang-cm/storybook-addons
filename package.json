@@ -1,0 +1,17 @@
+{
+  "name": "storybook-addons",
+  "private": true,
+  "description": "Harry Chuang's Storybook addons monorepo",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:figma-export": "npm run build -w @harrychuang/storybook-addon-figma-export"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/harrychuang/storybook-addons.git"
+  },
+  "license": "MIT"
+}

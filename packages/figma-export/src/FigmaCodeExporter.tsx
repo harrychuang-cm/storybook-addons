@@ -8,7 +8,6 @@ import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 
 import { createFigmaExportPayload } from "./domExport";
-import "./figma-code-exporter.css";
 import {
   isStoryIncludedForFigmaExport,
   resolveFigmaExportAddonOptions,
