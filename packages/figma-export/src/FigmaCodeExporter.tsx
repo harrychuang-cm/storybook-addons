@@ -114,7 +114,9 @@ export function FigmaCodeExporter({
       setCopiedFormat(format);
       setStatus("copied");
       setSummary(
-        `${payload.tokens.length} variables exported from ${payload.root.name}`,
+        format === "json"
+          ? `${payload.tokens.length} variables exported from ${payload.root.name}; JSON copied for importer.`
+          : `${payload.tokens.length} variables exported from ${payload.root.name}; script copied for plugin console only.`,
       );
     } catch (error) {
       setStatus("error");
@@ -199,7 +201,7 @@ export function FigmaCodeExporter({
                 ? "Copying"
                 : copiedFormat === "script" && status === "copied"
                   ? "Copied"
-                  : "Console Script"}
+                  : "Plugin Console Script"}
             </button>
           </div>
         </aside>

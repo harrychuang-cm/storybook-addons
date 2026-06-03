@@ -605,6 +605,22 @@ function pickBindings(
   return picked;
 }
 
+function getTextExportWidth({
+  computed,
+  text,
+  width,
+}: {
+  computed: CSSStyleDeclaration;
+  text: string;
+  width: number;
+}): number {
+  if (!text.trim()) return width;
+
+  const fontSize = cssLengthToNumber(computed.fontSize) ?? 14;
+  const safetyWidth = Math.max(12, fontSize);
+  return toFiniteNumber(width + safetyWidth);
+}
+
 function createTextLeafNode({
   bindings,
   computed,
@@ -627,6 +643,7 @@ function createTextLeafNode({
   const color = cssColorValue(computed.color);
   const fontWeight = Number.parseInt(computed.fontWeight, 10);
   const lineHeight = cssLineHeightToNumber(computed.lineHeight);
+  const exportWidth = getTextExportWidth({ computed, text, width });
 
   return {
     bindings: pickBindings(bindings, [
@@ -651,7 +668,7 @@ function createTextLeafNode({
       ...(lineHeight ? { lineHeight } : {}),
       opacity: Number(computed.opacity),
       overflow: computed.overflow,
-      width,
+      width: exportWidth,
       x,
       y,
     },

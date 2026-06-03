@@ -33,6 +33,9 @@ void (async function importStorybookStory(payload) {
 
   const layerOrder = { ref: 0, sys: 1, comp: 2 };
   const registry = new Map();
+  const rawTokenByName = new Map(
+    (payload.tokens || []).map((token) => [token.cssName, token]),
+  );
 
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
@@ -355,15 +358,68 @@ void (async function importStorybookStory(payload) {
     return first ? first.replace(/^["']|["']$/g, "") : "Inter";
   }
 
-  async function loadFont(fontName) {
-    if (!fontName || fontName === figma.mixed) return false;
+  function normalizeFontName(fontName) {
+    if (!fontName || fontName === figma.mixed) return undefined;
+    if (typeof fontName === "string") {
+      const parts = fontName.trim().split(/\\s+/);
+      if (parts.length >= 2) {
+        return {
+          family: parts.slice(0, -1).join(" "),
+          style: parts[parts.length - 1],
+        };
+      }
+      return { family: fontName, style: "Regular" };
+    }
+    if (fontName.family && fontName.style) return fontName;
+    return undefined;
+  }
 
-    const key = fontName.family + "\\n" + fontName.style;
+  function resolveTokenValue(tokenName, seen) {
+    if (!tokenName) return undefined;
+
+    const visited = seen || new Set();
+    if (visited.has(tokenName)) return undefined;
+    visited.add(tokenName);
+
+    const token = rawTokenByName.get(tokenName);
+    if (!token) return undefined;
+    if (token.alias) return resolveTokenValue(token.alias, visited);
+    return token.value ?? token.rawValue;
+  }
+
+  function getFontFamilyFromToken(tokenName) {
+    const value = resolveTokenValue(tokenName);
+    if (typeof value !== "string") return undefined;
+    return getFontFamily(value);
+  }
+
+  async function loadFont(fontName) {
+    const normalizedFontName = normalizeFontName(fontName);
+    if (!normalizedFontName) return false;
+
+    const key = normalizedFontName.family + "\\n" + normalizedFontName.style;
     if (loadedFontKeys.has(key)) return true;
 
-    await figma.loadFontAsync(fontName);
+    await figma.loadFontAsync(normalizedFontName);
     loadedFontKeys.add(key);
     return true;
+  }
+
+  async function loadBoundFontFamily(tokenName, fontWeight) {
+    const family = getFontFamilyFromToken(tokenName);
+    if (!family) return false;
+
+    const styleCandidates = getFontStyleCandidates(fontWeight || 400);
+    for (const style of styleCandidates) {
+      try {
+        await loadFont({ family, style });
+        return true;
+      } catch {
+        // Try next style before skipping the font-family binding.
+      }
+    }
+
+    return false;
   }
 
   async function loadTextFont(styles) {
@@ -438,7 +494,12 @@ void (async function importStorybookStory(payload) {
     }
     node.fills = [solidPaint(styles.color, registry.get(bindings.textColor))];
     safeResize(node, styles.width, styles.height);
-    safeBind(node, "fontFamily", bindings.fontFamily);
+    if (
+      !bindings.fontFamily ||
+      (await loadBoundFontFamily(bindings.fontFamily, styles.fontWeight || 400))
+    ) {
+      safeBind(node, "fontFamily", bindings.fontFamily);
+    }
     safeBind(node, "fontSize", bindings.fontSize);
     safeBind(node, "fontWeight", bindings.fontWeight);
     safeBind(node, "lineHeight", bindings.lineHeight);
