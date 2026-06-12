@@ -22,9 +22,38 @@ type FigmaExportToken = {
 type FigmaBindingName = "backgroundColor" | "borderColor" | "borderWidth" | "cornerRadius" | "fontFamily" | "fontSize" | "fontWeight" | "gap" | "height" | "lineHeight" | "opacity" | "paddingBottom" | "paddingLeft" | "paddingRight" | "paddingTop" | "textColor" | "width";
 type FigmaLayoutStrategy = "absolute" | "autoLayout";
 type FigmaNodeKind = "frame" | "image" | "svg" | "text";
+type FigmaExportArtifactKind = "component" | "page";
+type FigmaComponentReference = {
+    key: string;
+    name: string;
+    sourceName: string;
+    variant?: string;
+    variantProperties?: Record<string, string>;
+};
+type FigmaExportGradientStop = {
+    color: string;
+    position: number;
+    token?: string;
+};
+type FigmaExportLinearGradient = {
+    angle: number;
+    stops: FigmaExportGradientStop[];
+};
+type FigmaNodeConstraint = "CENTER" | "MAX" | "MIN" | "SCALE" | "STRETCH";
+type FigmaNodeConstraints = {
+    horizontal: FigmaNodeConstraint;
+    vertical: FigmaNodeConstraint;
+};
+type FigmaBorderSideName = "bottom" | "left" | "right" | "top";
+type FigmaExportBorderSide = {
+    color: string;
+    width: number;
+};
+type FigmaExportBorderSides = Partial<Record<FigmaBorderSideName, FigmaExportBorderSide>>;
 type FigmaExportNode = {
     bindings: Partial<Record<FigmaBindingName, string>>;
     children: FigmaExportNode[];
+    component?: FigmaComponentReference;
     kind: FigmaNodeKind;
     layoutStrategy?: FigmaLayoutStrategy;
     name: string;
@@ -33,9 +62,12 @@ type FigmaExportNode = {
     styles: {
         alignItems?: string;
         backgroundColor?: string;
+        backgroundLinearGradient?: FigmaExportLinearGradient;
         borderColor?: string;
+        borderSides?: FigmaExportBorderSides;
         borderWidth?: number;
         color?: string;
+        constraints?: FigmaNodeConstraints;
         display?: string;
         flexDirection?: string;
         fontFamily?: string;
@@ -44,25 +76,38 @@ type FigmaExportNode = {
         gap?: number;
         height: number;
         justifyContent?: string;
+        layoutAlign?: "STRETCH";
+        layoutGrow?: number;
+        layoutSizingHorizontal?: "HUG";
+        layoutSizingVertical?: "HUG";
         lineHeight?: number | "normal";
+        maxLines?: number;
+        textTruncation?: "ENDING";
         opacity?: number;
+        outOfFlow?: boolean;
         overflow?: string;
         paddingBottom?: number;
         paddingLeft?: number;
         paddingRight?: number;
         paddingTop?: number;
         radius?: number;
+        textAlign?: string;
+        textAlignVertical?: "CENTER";
+        textAutoResize?: "WIDTH_AND_HEIGHT";
         width: number;
         x: number;
         y: number;
     };
 };
 type FigmaExportPayload = {
+    artifactKind: FigmaExportArtifactKind;
+    component?: FigmaComponentReference;
     componentTitle: string;
     generatedAt: string;
     root: FigmaExportNode;
     storyId: string;
     storyName: string;
+    storyTitle: string;
     tokenSystem: {
         collections: Record<TokenLayer, string>;
         layers: Record<TokenLayer, string>;
@@ -70,7 +115,7 @@ type FigmaExportPayload = {
         prefix: string;
     };
     tokens: FigmaExportToken[];
-    version: 1;
+    version: 2;
 };
 
 type FigmaExportAddonOptions = {

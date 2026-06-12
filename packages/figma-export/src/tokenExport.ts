@@ -380,6 +380,23 @@ function toFigmaVariableName(cssName: string): string {
   return cssName.replace(/^--/, "").replaceAll("-", "/");
 }
 
+function getExportTokenValue(
+  token: TokenDefinition,
+  parsed: { type: FigmaVariableType; value: FigmaVariableValue } | undefined,
+): FigmaVariableValue | undefined {
+  if (
+    token.family !== "opacity" ||
+    parsed?.type !== "FLOAT" ||
+    typeof parsed.value !== "number"
+  ) {
+    return parsed?.value;
+  }
+
+  return parsed.value >= 0 && parsed.value <= 1
+    ? parsed.value * 100
+    : parsed.value;
+}
+
 function toExportToken(
   token: TokenDefinition,
   tokenByName: Map<string, TokenDefinition>,
@@ -390,7 +407,7 @@ function toExportToken(
   const parsed = alias ? undefined : parseRawValue(token.value);
 
   return {
-    ...(alias ? { alias } : { value: parsed?.value }),
+    ...(alias ? { alias } : { value: getExportTokenValue(token, parsed) }),
     collection: token.layer,
     cssName: token.name,
     figmaName: toFigmaVariableName(token.name),
