@@ -256,12 +256,18 @@ function getAliasTokenName(token, tokenSystem) {
 function toFigmaVariableName(cssName) {
   return cssName.replace(/^--/, "").replaceAll("-", "/");
 }
+function getExportTokenValue(token, parsed) {
+  if (token.family !== "opacity" || parsed?.type !== "FLOAT" || typeof parsed.value !== "number") {
+    return parsed?.value;
+  }
+  return parsed.value >= 0 && parsed.value <= 1 ? parsed.value * 100 : parsed.value;
+}
 function toExportToken(token, tokenByName, tokenSystem) {
   const alias = getAliasTokenName(token, tokenSystem);
   const type = getTokenType(token, tokenByName, tokenSystem);
   const parsed = alias ? void 0 : parseRawValue(token.value);
   return {
-    ...alias ? { alias } : { value: parsed?.value },
+    ...alias ? { alias } : { value: getExportTokenValue(token, parsed) },
     collection: token.layer,
     cssName: token.name,
     figmaName: toFigmaVariableName(token.name),
@@ -363,6 +369,85 @@ function cssColorValue(value) {
   if (!normalized || transparentValues.has(normalized)) return void 0;
   return normalized;
 }
+function clampUnit(value) {
+  return Math.min(1, Math.max(0, value));
+}
+function splitGradientArguments(value) {
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (const character of value) {
+    if (character === "(") depth += 1;
+    if (character === ")") depth = Math.max(0, depth - 1);
+    if (character === "," && depth === 0) {
+      parts.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+function parseLinearGradientAngle(value) {
+  if (!value) return void 0;
+  const normalized = value.trim().toLowerCase();
+  const degree = normalized.match(/^(-?\d*\.?\d+)deg$/);
+  if (degree) return Number(degree[1]);
+  if (normalized === "to right") return 90;
+  if (normalized === "to bottom") return 180;
+  if (normalized === "to left") return 270;
+  if (normalized === "to top") return 0;
+  return void 0;
+}
+function parseGradientStop(value, index, total) {
+  const colorMatch = value.trim().match(/^(#[0-9a-f]{3,8}|rgba?\([^)]*\))/i);
+  if (!colorMatch) return void 0;
+  const color = cssColorValue(colorMatch[1]);
+  if (!color) return void 0;
+  const positionMatch = value.slice(colorMatch[1].length).match(/(-?\d*\.?\d+)%/);
+  const position = positionMatch ? clampUnit(Number(positionMatch[1]) / 100) : total > 1 ? index / (total - 1) : 0;
+  return { color, position };
+}
+function parseLinearGradient(backgroundImage) {
+  const match = backgroundImage.trim().match(/^linear-gradient\((.*)\)$/i);
+  if (!match) return void 0;
+  const parts = splitGradientArguments(match[1]);
+  if (parts.length < 2) return void 0;
+  const angle = parseLinearGradientAngle(parts[0]);
+  const stopParts = angle === void 0 ? parts : parts.slice(1);
+  const stops = stopParts.map((part, index) => parseGradientStop(part, index, stopParts.length)).filter((stop) => Boolean(stop));
+  return stops.length >= 2 ? { angle: angle ?? 180, stops } : void 0;
+}
+function isColorTokenName(token) {
+  return token.includes("-color-") || token.endsWith("-color");
+}
+function findLinearGradientTokens(declarations, tokenSystem) {
+  for (let index = declarations.length - 1; index >= 0; index -= 1) {
+    const declaration = declarations[index];
+    if (!["background", "background-image"].includes(declaration.property)) {
+      continue;
+    }
+    if (!declaration.value.includes("linear-gradient")) continue;
+    const tokens = extractCssVariableNames(declaration.value, tokenSystem).filter(
+      isColorTokenName
+    );
+    if (tokens.length >= 2) return tokens;
+  }
+  return [];
+}
+function addLinearGradientStopTokens(gradient, declarations, tokenSystem) {
+  if (!gradient) return void 0;
+  const tokens = findLinearGradientTokens(declarations, tokenSystem);
+  if (tokens.length === 0) return gradient;
+  return {
+    ...gradient,
+    stops: gradient.stops.map((stop, index) => ({
+      ...stop,
+      ...tokens[index] ? { token: tokens[index] } : {}
+    }))
+  };
+}
 function cssBorderWidth(computed, side) {
   return cssLengthToNumber(computed.getPropertyValue(`border-${side}-width`)) ?? 0;
 }
@@ -401,22 +486,67 @@ function getElementName(element, options) {
   const base = component || icon || className || element.tagName.toLowerCase();
   return variant ? `${base}/${variant}` : base;
 }
+function toComponentKey(value) {
+  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return normalized || "component";
+}
+function toComponentLabel(value) {
+  return value.trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ").replace(/\b[a-z]/g, (match) => match.toUpperCase());
+}
+function getComponentReference(element, fallbackName) {
+  const sourceName = element.getAttribute("data-component");
+  if (!sourceName && !fallbackName) return void 0;
+  const variant = element.getAttribute("data-variant") || void 0;
+  const source = sourceName || fallbackName || "component";
+  const name = fallbackName || toComponentLabel(source);
+  const baseKey = toComponentKey(source);
+  const key = variant ? `${baseKey}--${toComponentKey(variant)}` : baseKey;
+  return {
+    key,
+    name,
+    sourceName: source,
+    ...variant ? { variant, variantProperties: { Variant: variant } } : {}
+  };
+}
+function getArtifactKind(storyTitle) {
+  return storyTitle.startsWith("Pages/") ? "page" : "component";
+}
+function hasComponentReference(node) {
+  return Boolean(node.component) || node.children.some(hasComponentReference);
+}
 function isAbsoluteFidelityRoot(element, options) {
   const component = element.getAttribute("data-component");
   return Boolean(component && options.absoluteFidelityComponents.has(component));
 }
-function getLayoutStrategy(computed, forceAbsoluteLayout) {
+function isFlexDisplay(display) {
+  return display.includes("flex");
+}
+function isOutOfFlowPositioned(computed) {
+  return computed.position === "absolute" || computed.position === "fixed";
+}
+function isFlexItem(element, computed) {
+  if (isOutOfFlowPositioned(computed)) return false;
+  const parentElement = element.parentElement;
+  if (!parentElement) return false;
+  return isFlexDisplay(window.getComputedStyle(parentElement).display);
+}
+function getLayoutStrategy(element, computed, forceAbsoluteLayout) {
   if (forceAbsoluteLayout) return "absolute";
-  return computed.display.includes("flex") ? "autoLayout" : "absolute";
+  return isFlexDisplay(computed.display) || isFlexItem(element, computed) ? "autoLayout" : "absolute";
 }
 function getExportDisplay(computed, layoutStrategy) {
-  if (layoutStrategy === "absolute" && computed.display.includes("flex")) {
+  if (layoutStrategy === "absolute" && isFlexDisplay(computed.display)) {
     return "block";
   }
   return computed.display;
 }
 function escapeSvgAttribute(value) {
   return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+function normalizeSvgStrokeDashValue(value) {
+  const normalized = value.trim();
+  if (!normalized || normalized === "none") return void 0;
+  return normalized.replace(/(-?\d+(?:\.\d+)?)px\b/g, "$1");
 }
 function serializeInlineSvg(element, width, height) {
   const clone = element.cloneNode(true);
@@ -434,6 +564,12 @@ function serializeInlineSvg(element, width, height) {
     const strokeWidth = originalStyle.strokeWidth;
     const strokeLinecap = originalStyle.strokeLinecap;
     const strokeLinejoin = originalStyle.strokeLinejoin;
+    const strokeDasharray = normalizeSvgStrokeDashValue(
+      originalStyle.strokeDasharray
+    );
+    const strokeDashoffset = normalizeSvgStrokeDashValue(
+      originalStyle.strokeDashoffset
+    );
     if (fill) clonedNode.setAttribute("fill", fill);
     if (originalStyle.fill === "none") clonedNode.setAttribute("fill", "none");
     if (stroke) clonedNode.setAttribute("stroke", stroke);
@@ -442,6 +578,8 @@ function serializeInlineSvg(element, width, height) {
     }
     if (strokeLinecap) clonedNode.setAttribute("stroke-linecap", strokeLinecap);
     if (strokeLinejoin) clonedNode.setAttribute("stroke-linejoin", strokeLinejoin);
+    if (strokeDasharray) clonedNode.setAttribute("stroke-dasharray", strokeDasharray);
+    if (strokeDashoffset) clonedNode.setAttribute("stroke-dashoffset", strokeDashoffset);
   });
   return clone.outerHTML;
 }
@@ -533,12 +671,13 @@ function createClipPathSvgNode(element, computed, rect, parentRect, rules, token
   const fill = cssColorValue(computed.backgroundColor) ?? cssColorValue(computed.color);
   if (!fill) return void 0;
   const transform = computed.transform && computed.transform.startsWith("matrix(-1") ? ` transform="rotate(180 ${width / 2} ${height / 2})"` : "";
+  const layoutStrategy = element.getAttribute("data-figma-layout-strategy") === "auto-layout" || isFlexItem(element, computed) ? "autoLayout" : "absolute";
   const svgText = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><polygon points="${escapeSvgAttribute(points)}" fill="${escapeSvgAttribute(fill)}"${transform}/></svg>`;
   return {
     bindings: collectBindings(element, rules, false, tokenSystem),
     children: [],
     kind: "svg",
-    layoutStrategy: "absolute",
+    layoutStrategy,
     name: getElementName(element, options),
     svgText,
     styles: {
@@ -555,9 +694,11 @@ function createClipPathSvgNode(element, computed, rect, parentRect, rules, token
 function createInlineSvgNode(element, computed, rect, parentRect, options) {
   const width = toFiniteNumber(rect.width);
   const height = toFiniteNumber(rect.height);
+  const component = getComponentReference(element);
   return {
     bindings: {},
     children: [],
+    ...component ? { component } : {},
     kind: "svg",
     layoutStrategy: "absolute",
     name: getElementName(element, options),
@@ -666,7 +807,7 @@ function findTokenForProperty(declarations, bindingName, tokenSystem) {
     const declaration = declarations[index];
     if (!properties.includes(declaration.property)) continue;
     const tokens = extractCssVariableNames(declaration.value, tokenSystem);
-    if (tokens.length === 0) continue;
+    if (tokens.length === 0) return void 0;
     if (declaration.property === "padding") {
       if (bindingName === "paddingTop" || bindingName === "paddingBottom") {
         return tokens[0];
@@ -687,14 +828,14 @@ function findTokenForProperty(declarations, bindingName, tokenSystem) {
     }
     if (declaration.property === "border") {
       if (bindingName === "borderColor") {
-        return tokens.find((token) => token.includes("-color-"));
+        return tokens.find(isColorTokenName);
       }
       if (bindingName === "borderWidth") {
-        return tokens.find((token) => !token.includes("-color-")) || tokens[0];
+        return tokens.find((token) => !isColorTokenName(token)) || tokens[0];
       }
     }
     if (bindingName === "backgroundColor" || bindingName === "textColor") {
-      return tokens.find((token) => token.includes("-color-")) || tokens[0];
+      return tokens.find(isColorTokenName) || tokens[0];
     }
     return tokens[0];
   }
@@ -718,12 +859,169 @@ function getTextExportWidth({
   const safetyWidth = Math.max(12, fontSize);
   return toFiniteNumber(width + safetyWidth);
 }
+function getTextExportX({
+  computed,
+  exportWidth,
+  width,
+  x
+}) {
+  const extraWidth = Math.max(0, exportWidth - width);
+  const textAlign = computed.textAlign.toLowerCase();
+  if (textAlign === "right" || textAlign === "end") {
+    return toFiniteNumber(x - extraWidth);
+  }
+  if (textAlign === "center") return toFiniteNumber(x - extraWidth / 2);
+  return x;
+}
+function justifyContentFromTextAlign(textAlign) {
+  const normalized = textAlign.trim().toLowerCase();
+  if (normalized === "center") return "center";
+  if (normalized === "right" || normalized === "end") return "flex-end";
+  return "flex-start";
+}
+function hasFixedFlexBasis(computed) {
+  if (!computed.flexBasis || computed.flexBasis === "auto" || computed.flexBasis === "content") {
+    return false;
+  }
+  return cssLengthToNumber(computed.flexBasis) !== void 0;
+}
+function isClippedSingleLineText(computed) {
+  const overflowX = computed.overflowX.toLowerCase();
+  const overflow = computed.overflow.toLowerCase();
+  const textOverflow = computed.textOverflow.toLowerCase();
+  const whiteSpace = computed.whiteSpace.toLowerCase();
+  const clipsInline = overflowX === "hidden" || overflowX === "clip" || overflow === "hidden" || overflow === "clip";
+  return clipsInline && textOverflow === "ellipsis" && whiteSpace === "nowrap";
+}
+function shouldAutoResizeText(element, computed) {
+  if (isClippedSingleLineText(computed)) return false;
+  if (element.getAttribute("data-figma-text-auto-width") === "true") return true;
+  const textAlign = computed.textAlign.toLowerCase();
+  if (textAlign === "center" || textAlign === "right" || textAlign === "end") {
+    const isSingleLine = computed.whiteSpace.toLowerCase().includes("nowrap");
+    if (!isFlexItem(element, computed) || !isSingleLine) return false;
+  }
+  if (!isFlexItem(element, computed)) return false;
+  if (hasFixedFlexBasis(computed)) return false;
+  return Number.parseFloat(computed.flexGrow || "0") === 0;
+}
+function getTextAutoResize(element, computed) {
+  return shouldAutoResizeText(element, computed) ? "WIDTH_AND_HEIGHT" : void 0;
+}
+function getLayoutAlign(element) {
+  return element.getAttribute("data-figma-layout-align") === "stretch" ? "STRETCH" : void 0;
+}
+var verticalSizeProperties = [
+  "height",
+  "block-size",
+  "min-height",
+  "min-block-size"
+];
+var horizontalSizeProperties = [
+  "width",
+  "inline-size",
+  "min-width",
+  "min-inline-size"
+];
+function hasExplicitSizeDeclaration(declarations, properties) {
+  return declarations.some(
+    (declaration) => properties.includes(declaration.property) && declaration.value.trim().toLowerCase() !== "auto"
+  );
+}
+function isStretchAlignment(value) {
+  return value === "stretch" || value === "normal";
+}
+function getResolvedFlexAlignment(element, computed) {
+  const alignSelf = computed.alignSelf;
+  if (alignSelf && alignSelf !== "auto") return alignSelf;
+  const parentElement = element.parentElement;
+  if (!parentElement) return "auto";
+  return window.getComputedStyle(parentElement).alignItems || "auto";
+}
+function getFlexParentCrossAxisInfo(element, computed) {
+  if (!isFlexItem(element, computed)) return void 0;
+  const parentElement = element.parentElement;
+  if (!parentElement) return void 0;
+  const parentComputed = window.getComputedStyle(parentElement);
+  if (!isFlexDisplay(parentComputed.display)) return void 0;
+  return {
+    crossAxis: parentComputed.flexDirection.startsWith("column") ? "horizontal" : "vertical",
+    stretched: isStretchAlignment(getResolvedFlexAlignment(element, computed))
+  };
+}
+function getInferredFrameLayoutAlign(element, computed, declarations) {
+  const crossAxisInfo = getFlexParentCrossAxisInfo(element, computed);
+  if (!crossAxisInfo || !crossAxisInfo.stretched) return void 0;
+  const crossSizeProperties = crossAxisInfo.crossAxis === "horizontal" ? horizontalSizeProperties : verticalSizeProperties;
+  if (hasExplicitSizeDeclaration(declarations, crossSizeProperties)) {
+    return void 0;
+  }
+  return "STRETCH";
+}
+function getLayoutSizingVertical(element, computed, bindings, declarations) {
+  if (bindings.height) return void 0;
+  if (hasExplicitSizeDeclaration(declarations, verticalSizeProperties)) {
+    return void 0;
+  }
+  if (element.getAttribute("data-figma-layout-sizing-vertical") === "hug") {
+    return "HUG";
+  }
+  if (!isFlexDisplay(computed.display)) return void 0;
+  const crossAxisInfo = getFlexParentCrossAxisInfo(element, computed);
+  if (crossAxisInfo?.crossAxis === "vertical" && crossAxisInfo.stretched) {
+    return void 0;
+  }
+  return "HUG";
+}
+function getLayoutGrow(element, computed) {
+  if (element.getAttribute("data-figma-layout-grow") === "1") return 1;
+  const flexGrow = Number.parseFloat(computed.flexGrow || "0");
+  return Number.isFinite(flexGrow) && flexGrow > 0 ? flexGrow : void 0;
+}
+function getLayoutSizingHorizontal(element, computed, bindings, declarations) {
+  if (bindings.width) return void 0;
+  if (hasExplicitSizeDeclaration(declarations, horizontalSizeProperties)) {
+    return void 0;
+  }
+  if (element.getAttribute("data-figma-layout-sizing-horizontal") === "hug") {
+    return "HUG";
+  }
+  if (isFlexItem(element, computed) || computed.display.includes("inline-flex")) {
+    if (hasFixedFlexBasis(computed)) return void 0;
+    if (Number.parseFloat(computed.flexGrow || "0") > 0) return void 0;
+    return "HUG";
+  }
+  if (isFlexDisplay(computed.display) && isOutOfFlowPositioned(computed)) {
+    return "HUG";
+  }
+  const parentElement = element.parentElement;
+  if (parentElement && isFlexDisplay(computed.display) && !isOutOfFlowPositioned(computed)) {
+    const parentComputed = window.getComputedStyle(parentElement);
+    if (parentComputed.display.includes("grid")) {
+      const justifySelf = computed.justifySelf;
+      const resolved = justifySelf && justifySelf !== "auto" ? justifySelf : parentComputed.justifyItems;
+      if (["start", "center", "end", "flex-start", "flex-end"].includes(resolved)) {
+        return "HUG";
+      }
+    }
+  }
+  return void 0;
+}
+function getTextAlignVertical(element) {
+  return element.getAttribute("data-figma-text-align-vertical") === "center" ? "CENTER" : void 0;
+}
 function createTextLeafNode({
   bindings,
   computed,
   height,
+  layoutStrategy,
   name,
+  outOfFlow,
   text,
+  textAutoResize,
+  layoutAlign,
+  layoutGrow,
+  textAlignVertical,
   width,
   x,
   y
@@ -731,7 +1029,9 @@ function createTextLeafNode({
   const color = cssColorValue(computed.color);
   const fontWeight = Number.parseInt(computed.fontWeight, 10);
   const lineHeight = cssLineHeightToNumber(computed.lineHeight);
-  const exportWidth = getTextExportWidth({ computed, text, width });
+  const isSingleLineTruncatedText = isClippedSingleLineText(computed);
+  const exportWidth = isSingleLineTruncatedText || Boolean(textAutoResize) || layoutGrow === 1 || hasFixedFlexBasis(computed) ? width : getTextExportWidth({ computed, text, width });
+  const exportX = getTextExportX({ computed, exportWidth, width, x });
   return {
     bindings: pickBindings(bindings, [
       "fontFamily",
@@ -742,7 +1042,7 @@ function createTextLeafNode({
     ]),
     children: [],
     kind: "text",
-    layoutStrategy: "absolute",
+    layoutStrategy: layoutStrategy ?? (layoutAlign ? "autoLayout" : "absolute"),
     name,
     text,
     styles: {
@@ -752,11 +1052,18 @@ function createTextLeafNode({
       fontSize: cssLengthToNumber(computed.fontSize) ?? 14,
       ...Number.isFinite(fontWeight) ? { fontWeight } : {},
       height,
+      ...layoutAlign ? { layoutAlign } : {},
+      ...layoutGrow ? { layoutGrow } : {},
       ...lineHeight ? { lineHeight } : {},
       opacity: Number(computed.opacity),
+      ...outOfFlow ? { outOfFlow: true } : {},
       overflow: computed.overflow,
+      ...isSingleLineTruncatedText ? { maxLines: 1, textTruncation: "ENDING" } : {},
+      textAlign: computed.textAlign,
+      ...textAlignVertical ? { textAlignVertical } : {},
+      ...textAutoResize ? { textAutoResize } : {},
       width: exportWidth,
-      x,
+      x: exportX,
       y
     }
   };
@@ -802,6 +1109,41 @@ function collectPseudoBindings(element, rules, pseudo, tokenSystem) {
   }
   return bindings;
 }
+function declarationsIncludeProperty(declarations, properties) {
+  return declarations.some(
+    (declaration) => properties.includes(declaration.property)
+  );
+}
+function getPseudoConstraints(declarations) {
+  const hasTop = declarationsIncludeProperty(declarations, [
+    "top",
+    "inset-block-start",
+    "inset-block",
+    "inset"
+  ]);
+  const hasBottom = declarationsIncludeProperty(declarations, [
+    "bottom",
+    "inset-block-end",
+    "inset-block",
+    "inset"
+  ]);
+  const hasLeft = declarationsIncludeProperty(declarations, [
+    "left",
+    "inset-inline-start",
+    "inset-inline",
+    "inset"
+  ]);
+  const hasRight = declarationsIncludeProperty(declarations, [
+    "right",
+    "inset-inline-end",
+    "inset-inline",
+    "inset"
+  ]);
+  return {
+    horizontal: hasLeft && hasRight ? "STRETCH" : hasRight && !hasLeft ? "MAX" : "MIN",
+    vertical: hasTop && hasBottom ? "STRETCH" : hasBottom && !hasTop ? "MAX" : "MIN"
+  };
+}
 function createPseudoNode(element, rules, pseudo, parentWidth, parentHeight, tokenSystem, options) {
   const style = window.getComputedStyle(element, `::${pseudo}`);
   const content = style.content.trim();
@@ -826,9 +1168,13 @@ function createPseudoNode(element, rules, pseudo, parentWidth, parentHeight, tok
     name: `${getElementName(element, options)}::${pseudo}`,
     styles: {
       backgroundColor,
+      constraints: getPseudoConstraints(
+        getPseudoMatchedDeclarations(element, rules, pseudo)
+      ),
       display: style.display,
       height,
       opacity: Number(style.opacity),
+      outOfFlow: true,
       overflow: style.overflow,
       width,
       x: toFiniteNumber(left + translateX),
@@ -863,69 +1209,39 @@ function findBorderLineToken(declarations, side, target, tokenSystem) {
     const tokens = extractCssVariableNames(declaration.value, tokenSystem);
     if (tokens.length === 0) continue;
     if (target === "color") {
-      return tokens.find((token) => token.includes("-color-")) || tokens[0];
+      return tokens.find(isColorTokenName) || tokens[0];
     }
-    return tokens.find((token) => !token.includes("-color-")) || tokens[0];
+    return tokens.find((token) => !isColorTokenName(token)) || tokens[0];
   }
   return void 0;
 }
-function collectBorderLineBindings(element, rules, side, tokenSystem) {
+function getVisibleBorderSides(computed) {
+  if (getUniformVisibleBorder(computed)) return void 0;
+  const sides = {};
+  for (const side of borderSides) {
+    if (!isVisibleBorderSide(computed, side)) continue;
+    const width = cssBorderWidth(computed, side);
+    const color = cssColorValue(cssBorderColor(computed, side));
+    if (!color || width <= 0) continue;
+    sides[side] = { color, width };
+  }
+  return Object.keys(sides).length > 0 ? sides : void 0;
+}
+function collectBorderSideBindings(element, rules, sides, tokenSystem) {
   const declarations = getMatchedDeclarations(element, rules);
-  const colorToken = findBorderLineToken(declarations, side, "color", tokenSystem);
-  const widthToken = findBorderLineToken(declarations, side, "width", tokenSystem);
   const bindings = {};
-  if (colorToken) bindings.backgroundColor = colorToken;
-  if (widthToken) {
-    if (side === "left" || side === "right") {
-      bindings.width = widthToken;
-    } else {
-      bindings.height = widthToken;
+  for (const side of borderSides) {
+    if (!sides[side]) continue;
+    if (!bindings.borderColor) {
+      const colorToken = findBorderLineToken(declarations, side, "color", tokenSystem);
+      if (colorToken) bindings.borderColor = colorToken;
+    }
+    if (!bindings.borderWidth) {
+      const widthToken = findBorderLineToken(declarations, side, "width", tokenSystem);
+      if (widthToken) bindings.borderWidth = widthToken;
     }
   }
   return bindings;
-}
-function createBorderLineNode(element, rules, side, parentWidth, parentHeight, tokenSystem, options) {
-  if (!isVisibleBorderSide(window.getComputedStyle(element), side)) return void 0;
-  const computed = window.getComputedStyle(element);
-  const borderWidth = cssBorderWidth(computed, side);
-  const backgroundColor = cssColorValue(cssBorderColor(computed, side));
-  if (!backgroundColor || borderWidth <= 0) return void 0;
-  const isVertical = side === "left" || side === "right";
-  const width = isVertical ? borderWidth : parentWidth;
-  const height = isVertical ? parentHeight : borderWidth;
-  const x = side === "right" ? parentWidth - borderWidth : 0;
-  const y = side === "bottom" ? parentHeight - borderWidth : 0;
-  return {
-    bindings: collectBorderLineBindings(element, rules, side, tokenSystem),
-    children: [],
-    kind: "frame",
-    layoutStrategy: "absolute",
-    name: `${getElementName(element, options)}__border-${side}`,
-    styles: {
-      backgroundColor,
-      display: "block",
-      height: toFiniteNumber(height),
-      opacity: Number(computed.opacity),
-      overflow: "visible",
-      width: toFiniteNumber(width),
-      x: toFiniteNumber(x),
-      y: toFiniteNumber(y)
-    }
-  };
-}
-function createBorderLineNodes(element, computed, rules, parentWidth, parentHeight, tokenSystem, options) {
-  if (getUniformVisibleBorder(computed)) return [];
-  return borderSides.map(
-    (side) => createBorderLineNode(
-      element,
-      rules,
-      side,
-      parentWidth,
-      parentHeight,
-      tokenSystem,
-      options
-    )
-  ).filter((node) => Boolean(node));
 }
 function collectBindings(element, rules, hasUniformVisibleBorder, tokenSystem) {
   const declarations = getMatchedDeclarations(element, rules);
@@ -1017,7 +1333,9 @@ async function createExportNode(element, rootRect, parentRect, rules, tokenSyste
   const width = toFiniteNumber(rect.width);
   const height = toFiniteNumber(rect.height);
   if (width <= 0 || height <= 0) return void 0;
-  const nextForceAbsoluteLayout = forceAbsoluteLayout || isAbsoluteFidelityRoot(element, options);
+  const forceAutoLayout = element.getAttribute("data-figma-layout-strategy") === "auto-layout";
+  const nextForceAbsoluteLayout = !forceAutoLayout && (forceAbsoluteLayout || isAbsoluteFidelityRoot(element, options));
+  const component = getComponentReference(element);
   if (element instanceof SVGElement) {
     return createInlineSvgNode(element, computed, rect, parentRect, options);
   }
@@ -1042,33 +1360,59 @@ async function createExportNode(element, rootRect, parentRect, rules, tokenSyste
         rules,
         tokenSystem,
         options,
-        nextForceAbsoluteLayout
+        nextForceAbsoluteLayout && !child.hasAttribute("data-component")
       )
     )
   )).filter((child) => Boolean(child));
   const directText = getDirectText(element);
   const backgroundColor = cssColorValue(computed.backgroundColor);
+  const declarations = getMatchedDeclarations(element, rules);
+  const backgroundLinearGradient = addLinearGradientStopTokens(
+    parseLinearGradient(computed.backgroundImage),
+    declarations,
+    tokenSystem
+  );
   const color = cssColorValue(computed.color);
   const border = getUniformVisibleBorder(computed);
+  const borderSideMap = getVisibleBorderSides(computed);
   const fontWeight = Number.parseInt(computed.fontWeight, 10);
   const radius = cssLengthToNumber(computed.borderTopLeftRadius);
   const lineHeight = cssLineHeightToNumber(computed.lineHeight);
   const gap = cssLengthToNumber(computed.columnGap) ?? cssLengthToNumber(computed.gap);
+  const layoutAlign = getLayoutAlign(element);
+  const layoutGrow = getLayoutGrow(element, computed);
+  const textLayoutStrategy = element.getAttribute("data-figma-layout-strategy") === "auto-layout" ? "autoLayout" : getLayoutStrategy(element, computed, nextForceAbsoluteLayout);
+  const textAlignVertical = getTextAlignVertical(element);
   const bindings = collectBindings(element, rules, Boolean(border), tokenSystem);
-  const layoutStrategy = getLayoutStrategy(computed, nextForceAbsoluteLayout);
+  if (borderSideMap) {
+    Object.assign(
+      bindings,
+      collectBorderSideBindings(element, rules, borderSideMap, tokenSystem)
+    );
+  }
+  const layoutSizingHorizontal = getLayoutSizingHorizontal(
+    element,
+    computed,
+    bindings,
+    declarations
+  );
+  const layoutSizingVertical = getLayoutSizingVertical(
+    element,
+    computed,
+    bindings,
+    declarations
+  );
+  const frameLayoutAlign = layoutAlign ?? getInferredFrameLayoutAlign(element, computed, declarations);
+  if (backgroundLinearGradient) {
+    delete bindings.backgroundColor;
+  }
+  const layoutStrategy = getLayoutStrategy(element, computed, nextForceAbsoluteLayout);
   const pseudoNodes = ["before", "after"].map(
     (pseudo) => createPseudoNode(element, rules, pseudo, width, height, tokenSystem, options)
   ).filter((node) => Boolean(node));
-  const borderLineNodes = createBorderLineNodes(
-    element,
-    computed,
-    rules,
-    width,
-    height,
-    tokenSystem,
-    options
-  );
-  const frameLayoutStrategy = pseudoNodes.length > 0 || borderLineNodes.length > 0 || hasPositionedChildren ? "absolute" : layoutStrategy;
+  const shouldPreserveComputedAutoLayout = layoutStrategy === "autoLayout" && isFlexDisplay(computed.display) && !hasPositionedChildren;
+  const frameLayoutStrategy = element.getAttribute("data-figma-layout-strategy") === "auto-layout" ? layoutStrategy : shouldPreserveComputedAutoLayout ? layoutStrategy : pseudoNodes.length > 0 || hasPositionedChildren ? "absolute" : layoutStrategy;
+  const elementOutOfFlow = isOutOfFlowPositioned(computed);
   if (directText && !hasElementChildren(element)) {
     if (hasBoxedTextStyle(computed, border)) {
       const paddingLeft = cssLengthToNumber(computed.paddingLeft) ?? 0;
@@ -1079,30 +1423,74 @@ async function createExportNode(element, rootRect, parentRect, rules, tokenSyste
         bindings,
         computed,
         height: Math.max(1, height - paddingTop - paddingBottom),
+        layoutStrategy: textLayoutStrategy,
         name: `${getElementName(element, options)}__text`,
         text: directText,
+        textAutoResize: getTextAutoResize(element, computed),
+        layoutAlign,
+        layoutGrow,
+        textAlignVertical,
         width: Math.max(1, width - paddingLeft - paddingRight),
         x: paddingLeft,
         y: paddingTop
       });
+      if (textLayoutStrategy === "autoLayout") {
+        return {
+          bindings,
+          children: [textNode],
+          ...component ? { component } : {},
+          kind: "frame",
+          layoutStrategy: "autoLayout",
+          name: getElementName(element, options),
+          styles: {
+            alignItems: "center",
+            ...backgroundColor ? { backgroundColor } : {},
+            ...backgroundLinearGradient ? { backgroundLinearGradient } : {},
+            ...border ? { borderColor: border.color, borderWidth: border.width } : {},
+            ...borderSideMap ? { borderSides: borderSideMap } : {},
+            display: "flex",
+            flexDirection: "row",
+            height,
+            justifyContent: justifyContentFromTextAlign(computed.textAlign),
+            opacity: Number(computed.opacity),
+            ...elementOutOfFlow ? { outOfFlow: true } : {},
+            overflow: computed.overflow,
+            paddingBottom,
+            paddingLeft,
+            paddingRight,
+            paddingTop,
+            ...radius !== void 0 && radius > 0 ? { radius } : {},
+            ...layoutSizingHorizontal ? { layoutSizingHorizontal } : {},
+            ...layoutSizingHorizontal && !bindings.height ? { layoutSizingVertical: "HUG" } : {},
+            width,
+            x: toFiniteNumber(rect.left - parentRect.left),
+            y: toFiniteNumber(rect.top - parentRect.top)
+          }
+        };
+      }
       return {
         bindings,
-        children: [textNode, ...borderLineNodes],
+        children: [textNode],
+        ...component ? { component } : {},
         kind: "frame",
         layoutStrategy: "absolute",
         name: getElementName(element, options),
         styles: {
           ...backgroundColor ? { backgroundColor } : {},
+          ...backgroundLinearGradient ? { backgroundLinearGradient } : {},
           ...border ? { borderColor: border.color, borderWidth: border.width } : {},
+          ...borderSideMap ? { borderSides: borderSideMap } : {},
           display: getExportDisplay(computed, "absolute"),
           height,
           opacity: Number(computed.opacity),
+          ...elementOutOfFlow ? { outOfFlow: true } : {},
           overflow: computed.overflow,
           paddingBottom,
           paddingLeft,
           paddingRight,
           paddingTop,
           ...radius !== void 0 && radius > 0 ? { radius } : {},
+          ...layoutSizingHorizontal ? { layoutSizingHorizontal } : {},
           width,
           x: toFiniteNumber(rect.left - parentRect.left),
           y: toFiniteNumber(rect.top - parentRect.top)
@@ -1113,46 +1501,63 @@ async function createExportNode(element, rootRect, parentRect, rules, tokenSyste
       bindings,
       computed,
       height,
+      layoutStrategy: textLayoutStrategy,
       name: getElementName(element, options),
+      outOfFlow: elementOutOfFlow,
       text: directText,
+      textAutoResize: getTextAutoResize(element, computed),
+      layoutAlign,
+      layoutGrow,
+      textAlignVertical,
       width,
       x: toFiniteNumber(rect.left - parentRect.left),
       y: toFiniteNumber(rect.top - parentRect.top)
     });
   }
   const kind = element instanceof HTMLImageElement ? "image" : "frame";
+  const elementName = getElementName(element, options);
+  const frameStyles = {
+    ...computed.alignItems ? { alignItems: computed.alignItems } : {},
+    ...backgroundColor ? { backgroundColor } : {},
+    ...backgroundLinearGradient ? { backgroundLinearGradient } : {},
+    ...border ? { borderColor: border.color, borderWidth: border.width } : {},
+    ...borderSideMap ? { borderSides: borderSideMap } : {},
+    ...color ? { color } : {},
+    display: getExportDisplay(computed, frameLayoutStrategy),
+    ...frameLayoutStrategy === "autoLayout" ? { flexDirection: computed.flexDirection } : {},
+    fontFamily: computed.fontFamily,
+    fontSize: cssLengthToNumber(computed.fontSize) ?? 14,
+    ...Number.isFinite(fontWeight) ? { fontWeight } : {},
+    ...gap !== void 0 && gap >= 0 ? { gap } : {},
+    height,
+    ...computed.justifyContent ? { justifyContent: computed.justifyContent } : {},
+    ...frameLayoutAlign ? { layoutAlign: frameLayoutAlign } : {},
+    ...layoutGrow ? { layoutGrow } : {},
+    ...layoutSizingHorizontal ? { layoutSizingHorizontal } : {},
+    ...layoutSizingVertical ? { layoutSizingVertical } : {},
+    ...lineHeight ? { lineHeight } : {},
+    opacity: Number(computed.opacity),
+    ...elementOutOfFlow ? { outOfFlow: true } : {},
+    overflow: computed.overflow,
+    paddingBottom: cssLengthToNumber(computed.paddingBottom) ?? 0,
+    paddingLeft: cssLengthToNumber(computed.paddingLeft) ?? 0,
+    paddingRight: cssLengthToNumber(computed.paddingRight) ?? 0,
+    paddingTop: cssLengthToNumber(computed.paddingTop) ?? 0,
+    ...radius !== void 0 && radius > 0 ? { radius } : {},
+    ...textAlignVertical ? { textAlignVertical } : {},
+    width,
+    x: toFiniteNumber(rect.left - parentRect.left),
+    y: toFiniteNumber(rect.top - parentRect.top)
+  };
   return {
     bindings,
-    children: kind === "image" ? [] : [...childNodes, ...pseudoNodes, ...borderLineNodes],
+    children: kind === "image" ? [] : [...childNodes, ...pseudoNodes],
+    ...component ? { component } : {},
     kind,
     layoutStrategy: kind === "image" ? "absolute" : frameLayoutStrategy,
-    name: getElementName(element, options),
+    name: elementName,
     ...kind === "image" && element instanceof HTMLImageElement ? { svgText: await fetchSvgText(element, options) } : {},
-    styles: {
-      ...computed.alignItems ? { alignItems: computed.alignItems } : {},
-      ...backgroundColor ? { backgroundColor } : {},
-      ...border ? { borderColor: border.color, borderWidth: border.width } : {},
-      ...color ? { color } : {},
-      display: getExportDisplay(computed, frameLayoutStrategy),
-      ...frameLayoutStrategy === "autoLayout" ? { flexDirection: computed.flexDirection } : {},
-      fontFamily: computed.fontFamily,
-      fontSize: cssLengthToNumber(computed.fontSize) ?? 14,
-      ...Number.isFinite(fontWeight) ? { fontWeight } : {},
-      ...gap !== void 0 && gap >= 0 ? { gap } : {},
-      height,
-      ...computed.justifyContent ? { justifyContent: computed.justifyContent } : {},
-      ...lineHeight ? { lineHeight } : {},
-      opacity: Number(computed.opacity),
-      overflow: computed.overflow,
-      paddingBottom: cssLengthToNumber(computed.paddingBottom) ?? 0,
-      paddingLeft: cssLengthToNumber(computed.paddingLeft) ?? 0,
-      paddingRight: cssLengthToNumber(computed.paddingRight) ?? 0,
-      paddingTop: cssLengthToNumber(computed.paddingTop) ?? 0,
-      ...radius !== void 0 && radius > 0 ? { radius } : {},
-      width,
-      x: toFiniteNumber(rect.left - parentRect.left),
-      y: toFiniteNumber(rect.top - parentRect.top)
-    }
+    styles: frameStyles
   };
 }
 async function createFigmaExportPayload({
@@ -1160,12 +1565,14 @@ async function createFigmaExportPayload({
   options,
   scope,
   storyId,
-  storyName
+  storyName,
+  storyTitle
 }) {
   const root = findExportRoot(scope);
   if (!root) {
     throw new Error("No exportable story root was found.");
   }
+  const artifactKind = getArtifactKind(storyTitle);
   const rules = getCssRules();
   const tokenSystem = detectTokenSystem(options);
   const rootRect = root.getBoundingClientRect();
@@ -1182,20 +1589,27 @@ async function createFigmaExportPayload({
   }
   rootNode.styles.x = 0;
   rootNode.styles.y = 0;
+  const component = artifactKind === "component" ? rootNode.component ?? (!hasComponentReference(rootNode) ? getComponentReference(root, componentTitle) : void 0) : void 0;
   const tokenNames = /* @__PURE__ */ new Set();
   function collectNodeTokens(node) {
     Object.values(node.bindings).forEach((token) => {
       if (token) tokenNames.add(token);
     });
+    node.styles.backgroundLinearGradient?.stops.forEach((stop) => {
+      if (stop.token) tokenNames.add(stop.token);
+    });
     node.children.forEach(collectNodeTokens);
   }
   collectNodeTokens(rootNode);
   return {
+    artifactKind,
+    ...component ? { component } : {},
     componentTitle,
     generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
     root: rootNode,
     storyId,
     storyName,
+    storyTitle,
     tokenSystem: {
       collections: tokenSystem.collections,
       layers: tokenSystem.layers,
@@ -1203,7 +1617,7 @@ async function createFigmaExportPayload({
       prefix: tokenSystem.prefix
     },
     tokens: collectTokensForExport(tokenNames, tokenSystem),
-    version: 1
+    version: 2
   };
 }
 
@@ -1271,6 +1685,8 @@ void (async function importStorybookStory(payload) {
   };
   const PLUGIN_DATA_TOKEN_KEY =
     payload.tokenSystem?.pluginDataKey || "storybookCssToken";
+  const PLUGIN_DATA_COMPONENT_KEY =
+    payload.componentSystem?.pluginDataKey || "storybookComponentKey";
 
   const BINDABLE_RADIUS_FIELDS = [
     "topLeftRadius",
@@ -1281,6 +1697,8 @@ void (async function importStorybookStory(payload) {
 
   const layerOrder = { ref: 0, sys: 1, comp: 2 };
   const registry = new Map();
+  const componentRegistry = new Map();
+  let componentDefinitionOffsetY = 0;
   const rawTokenByName = new Map(
     (payload.tokens || []).map((token) => [token.cssName, token]),
   );
@@ -1380,6 +1798,341 @@ void (async function importStorybookStory(payload) {
     }
   }
 
+  function getNodePluginData(node, key) {
+    try {
+      return typeof node.getPluginData === "function" ? node.getPluginData(key) : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function setNodePluginData(node, key, value) {
+    try {
+      if (typeof node.setPluginData === "function") {
+        node.setPluginData(key, value);
+      }
+    } catch {
+      // Plugin data is metadata only; continue if unsupported.
+    }
+  }
+
+  function getComponentDisplayName(component) {
+    if (!component) return "";
+    if (component.variant) {
+      return component.name + ", Variant=" + component.variant;
+    }
+    return component.name;
+  }
+
+  function findLocalComponent(component) {
+    if (!component?.key) return undefined;
+    const cached = componentRegistry.get(component.key);
+    if (cached) return cached;
+
+    const nodes = figma.root.findAll((node) => node.type === "COMPONENT");
+    const displayName = getComponentDisplayName(component);
+    const sourceName = component.sourceName || component.key;
+    const found = nodes.find((node) => {
+      const nodeKey = getNodePluginData(node, PLUGIN_DATA_COMPONENT_KEY);
+      if (nodeKey === component.key) {
+        return true;
+      }
+      if (nodeKey) return false;
+
+      const nodeSource = getNodePluginData(node, "storybookComponentSource");
+      const parentSource =
+        node.parent?.type === "COMPONENT_SET"
+          ? getNodePluginData(node.parent, "storybookComponentSource")
+          : "";
+      const knownSource = nodeSource || parentSource;
+      if (knownSource && knownSource !== sourceName) return false;
+
+      if (component.variant) return node.name === displayName;
+      return node.name === displayName || node.name === component.name;
+    });
+
+    if (found) componentRegistry.set(component.key, found);
+    return found;
+  }
+
+  function tagComponentNode(node, component) {
+    if (!component?.key) return;
+    setNodePluginData(node, PLUGIN_DATA_COMPONENT_KEY, component.key);
+    setNodePluginData(node, "storybookComponentName", component.name);
+    setNodePluginData(node, "storybookComponentSource", component.sourceName || component.key);
+  }
+
+  function getOrCreatePage(name) {
+    const normalizedName = String(name || "").trim() || "Components";
+    const existing = figma.root.children.find(
+      (page) => page.name.toLowerCase() === normalizedName.toLowerCase(),
+    );
+    if (existing) return existing;
+
+    const page = figma.createPage();
+    page.name = normalizedName;
+    return page;
+  }
+
+  function getComponentDefinitionParentPage() {
+    if (payload.artifactKind !== "page") return figma.currentPage;
+    return getOrCreatePage(payload.componentSystem?.componentsPageName || "Components");
+  }
+
+  function getNextComponentDefinitionY(page) {
+    if (componentDefinitionOffsetY === 0 && page.children.length > 0) {
+      componentDefinitionOffsetY = page.children.reduce((maxBottom, child) => {
+        const bottom = (child.y || 0) + (child.height || 0);
+        return Math.max(maxBottom, bottom);
+      }, 0);
+      if (componentDefinitionOffsetY > 0) componentDefinitionOffsetY += 24;
+    }
+
+    return componentDefinitionOffsetY;
+  }
+
+  function parkComponentDefinition(node) {
+    const parentPage = getComponentDefinitionParentPage();
+    const nextY = getNextComponentDefinitionY(parentPage);
+    if (node.parent !== parentPage) parentPage.appendChild(node);
+    const rootWidth = payload.root?.styles?.width || 0;
+    node.x = payload.artifactKind === "page" ? 0 : rootWidth + 80;
+    node.y = nextY;
+    componentDefinitionOffsetY += (node.height || 0) + 24;
+  }
+
+  function moveExistingComponentDefinitionToTargetPage(componentNode) {
+    if (payload.artifactKind !== "page" || !componentNode) return;
+
+    const parentPage = getComponentDefinitionParentPage();
+    const definitionNode = getComponentSetParent(componentNode) || componentNode;
+    if (definitionNode.parent === parentPage) return;
+
+    const nextY = getNextComponentDefinitionY(parentPage);
+    parentPage.appendChild(definitionNode);
+    definitionNode.x = 0;
+    definitionNode.y = nextY;
+    componentDefinitionOffsetY += (definitionNode.height || 0) + 24;
+  }
+
+  function createSvgSceneNode(spec) {
+    const svgNode = figma.createNodeFromSvg(spec.svgText || "");
+    svgNode.name = spec.name || "svg";
+    safeResize(svgNode, spec.styles.width, spec.styles.height);
+    svgNode.x = spec.styles.x || 0;
+    svgNode.y = spec.styles.y || 0;
+    return svgNode;
+  }
+
+  function getLinearGradientTransform(angle) {
+    const normalized = ((Number(angle) % 360) + 360) % 360;
+    if (normalized === 270) return [[-1, 0, 1], [0, 1, 0]];
+    if (normalized === 180) return [[0, 1, 0], [-1, 0, 1]];
+    if (normalized === 0) return [[0, -1, 1], [1, 0, 0]];
+    return [[1, 0, 0], [0, 1, 0]];
+  }
+
+  function linearGradientPaint(gradient) {
+    return {
+      type: "GRADIENT_LINEAR",
+      gradientTransform: getLinearGradientTransform(gradient?.angle ?? 90),
+      gradientStops: (gradient?.stops || []).map((stop, index, stops) => {
+        const variable = registry.get(stop.token);
+        const colorStop = {
+          position:
+            typeof stop.position === "number"
+              ? clamp(stop.position, 0, 1)
+              : stops.length > 1
+                ? index / (stops.length - 1)
+                : 0,
+          color: cloneColor(colorFromCss(stop.color)),
+        };
+        if (variable?.id) {
+          colorStop.boundVariables = {
+            color: { type: "VARIABLE_ALIAS", id: variable.id },
+          };
+        }
+        return colorStop;
+      }),
+    };
+  }
+
+  function canCreateComponentDefinition(spec) {
+    return spec.kind === "frame" || ((spec.kind === "image" || spec.kind === "svg") && Boolean(spec.svgText));
+  }
+
+  function collectComponentDefinitionSpecs(spec, componentTitle, output, seen) {
+    const specs = output || [];
+    const seenKeys = seen || new Set();
+    if (!spec) return specs;
+
+    const component = spec.component;
+    if (
+      component?.key &&
+      component.name === componentTitle &&
+      canCreateComponentDefinition(spec) &&
+      !seenKeys.has(component.key)
+    ) {
+      seenKeys.add(component.key);
+      specs.push(spec);
+      return specs;
+    }
+
+    for (const childSpec of spec.children || []) {
+      collectComponentDefinitionSpecs(childSpec, componentTitle, specs, seenKeys);
+    }
+    return specs;
+  }
+
+  function collectPageComponentDefinitionSpecs(spec, output, seen, isRoot) {
+    const specs = output || [];
+    const seenKeys = seen || new Set();
+    const isRootNode = isRoot !== false;
+    if (!spec) return specs;
+
+    const component = spec.component;
+    if (
+      !isRootNode &&
+      component?.key &&
+      canCreateComponentDefinition(spec) &&
+      !seenKeys.has(component.key)
+    ) {
+      seenKeys.add(component.key);
+      specs.push(spec);
+    }
+
+    for (const childSpec of spec.children || []) {
+      collectPageComponentDefinitionSpecs(childSpec, specs, seenKeys, false);
+    }
+    return specs;
+  }
+
+  function getComponentSetParent(node) {
+    return node?.parent?.type === "COMPONENT_SET" ? node.parent : undefined;
+  }
+
+  async function importComponentVariantSet(specs) {
+    const existingComponents = specs
+      .map((spec) => ({ spec, component: findLocalComponent(spec.component) }))
+      .filter((entry) => Boolean(entry.component));
+    const existingSet = existingComponents.map((entry) => getComponentSetParent(entry.component)).find(Boolean);
+    if (existingSet) {
+      for (const { spec, component } of existingComponents) {
+        await updateExistingComponentDefinition(component, spec);
+      }
+      return existingSet;
+    }
+
+    const componentNodes = [];
+    for (const spec of specs) {
+      componentNodes.push(
+        await ensureComponentDefinition(spec, spec.component, {
+          reuseComponents: true,
+        }),
+      );
+    }
+
+    if (componentNodes.length > 1 && typeof figma.combineAsVariants === "function") {
+      const parentPage = getComponentDefinitionParentPage();
+      const componentSet = figma.combineAsVariants(componentNodes, parentPage);
+      const nextY = payload.artifactKind === "page" ? getNextComponentDefinitionY(parentPage) : 0;
+      componentSet.name = payload.componentTitle;
+      componentSet.x = 0;
+      componentSet.y = nextY;
+      if (payload.artifactKind === "page") {
+        componentDefinitionOffsetY = nextY + (componentSet.height || 0) + 24;
+      }
+      setNodePluginData(componentSet, "storybookComponentName", payload.componentTitle);
+      setNodePluginData(
+        componentSet,
+        "storybookComponentSource",
+        specs[0]?.component?.sourceName || payload.componentTitle,
+      );
+      return componentSet;
+    }
+
+    return componentNodes[0];
+  }
+
+  async function applyInstanceOverrides(node, spec) {
+    if (!node || !spec) return;
+
+    if (spec.kind === "text" && node.type === "TEXT") {
+      await loadTextNodeFonts(node);
+      const nextText = spec.text || "";
+      if (node.characters !== nextText) {
+        node.characters = nextText;
+      }
+
+      if (spec.styles?.textAutoResize && "textAutoResize" in node) {
+        try {
+          node.textAutoResize = spec.styles.textAutoResize;
+        } catch {
+          // Some instance text overrides cannot change auto-resize mode.
+        }
+      } else {
+        safeResize(node, spec.styles?.width, spec.styles?.height);
+      }
+      applyTextTruncation(node, spec.styles || {});
+      return;
+    }
+
+    if (!("children" in node)) return;
+
+    const nodeChildren = Array.from(node.children || []);
+    const specChildren = spec.children || [];
+    for (let index = 0; index < specChildren.length; index += 1) {
+      await applyInstanceOverrides(nodeChildren[index], specChildren[index]);
+    }
+  }
+
+  async function updateExistingComponentDefinition(node, spec) {
+    if (!node || !spec) return;
+
+    if (spec.kind === "text" && node.type === "TEXT") {
+      await applyInstanceOverrides(node, spec);
+      const styles = spec.styles || {};
+      const bindings = spec.bindings || {};
+      if (styles.color) {
+        node.fills = [solidPaint(styles.color, registry.get(bindings.textColor))];
+      }
+      safeBind(node, "fontSize", bindings.fontSize);
+      safeBind(node, "fontWeight", bindings.fontWeight);
+      safeBind(node, "lineHeight", bindings.lineHeight);
+      return;
+    }
+
+    if ("fills" in node && spec.kind !== "text") {
+      const styles = spec.styles || {};
+      const bindings = spec.bindings || {};
+      safeResize(node, styles.width, styles.height);
+      if ("clipsContent" in node) node.clipsContent = styles.overflow === "hidden";
+      if ("opacity" in node) node.opacity = styles.opacity ?? 1;
+      setFrameFills(node, styles, bindings);
+      setStrokes(node, styles, bindings);
+      applyRadius(node, styles, bindings);
+      applyAutoLayout(node, spec, styles, bindings);
+      safeBind(node, "width", bindings.width);
+      safeBind(node, "height", bindings.height);
+      safeBind(node, "opacity", bindings.opacity);
+      if (!styles.borderSides) safeBind(node, "strokeWeight", bindings.borderWidth);
+    }
+
+    if (!("children" in node)) return;
+
+    const nodeChildren = Array.from(node.children || []);
+    const specChildren = spec.children || [];
+    for (let index = 0; index < specChildren.length; index += 1) {
+      const childSpec = specChildren[index];
+      const childNode = nodeChildren[index];
+      await updateExistingComponentDefinition(childNode, childSpec);
+      if (childNode) {
+        applyAutoLayoutChildSizing(node, childNode, childSpec);
+        positionChildNode(node, childNode, childSpec);
+      }
+    }
+  }
+
   async function findExistingVariable(collection, spec) {
     const variables = await figma.variables.getLocalVariablesAsync();
     return variables.find((variable) => {
@@ -1387,6 +2140,22 @@ void (async function importStorybookStory(payload) {
       if (getVariablePluginData(variable, PLUGIN_DATA_TOKEN_KEY) === spec.cssName) return true;
       return variable.name === spec.figmaName;
     });
+  }
+
+  function isOpacityVariableSpec(spec) {
+    return spec.type === "FLOAT" && (
+      (Array.isArray(spec.scopes) && spec.scopes.includes("OPACITY")) ||
+      String(spec.cssName || "").includes("-opacity-") ||
+      String(spec.figmaName || "").includes("/opacity/")
+    );
+  }
+
+  function getVariableValueForMode(spec) {
+    if (!isOpacityVariableSpec(spec)) return spec.value;
+
+    const value = Number(spec.value);
+    if (!Number.isFinite(value)) return spec.value;
+    return value >= 0 && value <= 1 ? value * 100 : value;
   }
 
   async function upsertVariable(spec) {
@@ -1430,7 +2199,7 @@ void (async function importStorybookStory(payload) {
     } else if (spec.type === "COLOR") {
       variable.setValueForMode(modeId, cloneColor(spec.value));
     } else {
-      variable.setValueForMode(modeId, spec.value);
+      variable.setValueForMode(modeId, getVariableValueForMode(spec));
     }
 
     registry.set(spec.cssName, variable);
@@ -1479,10 +2248,47 @@ void (async function importStorybookStory(payload) {
     }
   }
 
+  function isBorderFallbackNode(spec) {
+    return String(spec?.name || "").includes("__border-");
+  }
+
+  function isAbsoluteLayoutNodeSpec(spec) {
+    return spec?.layoutStrategy === "absolute" || isBorderFallbackNode(spec);
+  }
+
+  function applyNodeConstraints(child, constraints) {
+    if (!constraints || !("constraints" in child)) return;
+
+    try {
+      child.constraints = constraints;
+    } catch {
+      // Some Figma nodes do not support constraints.
+    }
+  }
+
+  function getAbsoluteChildX(parent, child, childSpec, styles) {
+    const name = String(childSpec?.name || "");
+    if (!name.includes("__border-right")) return styles.x || 0;
+
+    const parentWidth = typeof parent.width === "number" ? parent.width : 0;
+    const childWidth = styles.width || child.width || 1;
+    return Math.max(0, parentWidth - childWidth);
+  }
+
+  function getAbsoluteChildY(parent, child, childSpec, styles) {
+    const name = String(childSpec?.name || "");
+    if (!name.includes("__border-bottom")) return styles.y || 0;
+
+    const parentHeight = typeof parent.height === "number" ? parent.height : 0;
+    const childHeight = styles.height || child.height || 1;
+    return Math.max(0, parentHeight - childHeight);
+  }
+
   function positionChildNode(parent, child, childSpec) {
     const styles = childSpec.styles || {};
+    applyNodeConstraints(child, styles.constraints);
 
-    if (childSpec.layoutStrategy === "absolute") {
+    if (isAbsoluteLayoutNodeSpec(childSpec)) {
       if ("layoutPositioning" in child) {
         try {
           child.layoutPositioning = "ABSOLUTE";
@@ -1491,9 +2297,17 @@ void (async function importStorybookStory(payload) {
         }
       }
 
-      child.x = styles.x || 0;
-      child.y = styles.y || 0;
+      child.x = getAbsoluteChildX(parent, child, childSpec, styles);
+      child.y = getAbsoluteChildY(parent, child, childSpec, styles);
       return;
+    }
+
+    if ("layoutPositioning" in child) {
+      try {
+        child.layoutPositioning = "AUTO";
+      } catch {
+        // Older Figma nodes may not allow layout positioning changes.
+      }
     }
 
     if (parent.layoutMode === "NONE") {
@@ -1504,7 +2318,9 @@ void (async function importStorybookStory(payload) {
 
   function setFrameFills(node, styles, bindings) {
     const variable = registry.get(bindings.backgroundColor);
-    if (styles.backgroundColor || variable) {
+    if (styles.backgroundLinearGradient) {
+      node.fills = [linearGradientPaint(styles.backgroundLinearGradient)];
+    } else if (styles.backgroundColor || variable) {
       node.fills = [solidPaint(styles.backgroundColor, variable)];
     } else {
       node.fills = [];
@@ -1513,6 +2329,26 @@ void (async function importStorybookStory(payload) {
 
   function setStrokes(node, styles, bindings) {
     const colorVariable = registry.get(bindings.borderColor);
+
+    if (styles.borderSides) {
+      const firstSide = ["top", "right", "bottom", "left"]
+        .map((side) => styles.borderSides[side])
+        .find(Boolean);
+      if (!firstSide) return;
+
+      node.strokes = [solidPaint(firstSide.color, colorVariable)];
+      try {
+        node.strokeAlign = "INSIDE";
+        node.strokeTopWeight = styles.borderSides.top?.width ?? 0;
+        node.strokeRightWeight = styles.borderSides.right?.width ?? 0;
+        node.strokeBottomWeight = styles.borderSides.bottom?.width ?? 0;
+        node.strokeLeftWeight = styles.borderSides.left?.width ?? 0;
+      } catch {
+        // Per-side stroke weights are unsupported on some node types.
+      }
+      return;
+    }
+
     const widthVariable = registry.get(bindings.borderWidth);
     if (!styles.borderWidth && !widthVariable) return;
     if (!styles.borderColor && !colorVariable) return;
@@ -1546,6 +2382,14 @@ void (async function importStorybookStory(payload) {
     return "MIN";
   }
 
+  function mapTextAlignHorizontal(value) {
+    const normalized = String(value || "").toLowerCase();
+    if (normalized === "center") return "CENTER";
+    if (normalized === "right" || normalized === "end") return "RIGHT";
+    if (normalized === "justify") return "JUSTIFIED";
+    return "LEFT";
+  }
+
   function applyAutoLayout(node, spec, styles, bindings) {
     if (spec.layoutStrategy !== "autoLayout") {
       setFrameLayoutMode(node, "NONE");
@@ -1563,8 +2407,17 @@ void (async function importStorybookStory(payload) {
         ? "VERTICAL"
         : "HORIZONTAL",
     );
-    node.primaryAxisSizingMode = "FIXED";
-    node.counterAxisSizingMode = "FIXED";
+    const isHorizontalLayout = !String(styles.flexDirection || "").startsWith("column");
+    const horizontalSizingMode =
+      styles.layoutSizingHorizontal === "HUG" ? "AUTO" : "FIXED";
+    const verticalSizingMode =
+      styles.layoutSizingVertical === "HUG" ? "AUTO" : "FIXED";
+    node.primaryAxisSizingMode = isHorizontalLayout
+      ? horizontalSizingMode
+      : verticalSizingMode;
+    node.counterAxisSizingMode = isHorizontalLayout
+      ? verticalSizingMode
+      : horizontalSizingMode;
     node.primaryAxisAlignItems = mapAxisAlignment(styles.justifyContent);
     node.counterAxisAlignItems = mapCounterAlignment(styles.alignItems);
     node.itemSpacing = styles.gap ?? 0;
@@ -1578,6 +2431,28 @@ void (async function importStorybookStory(payload) {
     safeBind(node, "paddingRight", bindings.paddingRight);
     safeBind(node, "paddingTop", bindings.paddingTop);
     safeBind(node, "paddingBottom", bindings.paddingBottom);
+  }
+
+  function applyAutoLayoutChildSizing(parent, child, spec) {
+    if (parent.layoutMode === "NONE") return;
+
+    const styles = spec.styles || {};
+    const layoutGrow = Number(styles.layoutGrow || 0);
+    if (layoutGrow > 0 && "layoutGrow" in child) {
+      try {
+        child.layoutGrow = 1;
+      } catch {
+        // Some Figma nodes do not support fill-container sizing.
+      }
+    }
+
+    if (styles.layoutAlign !== "STRETCH") return;
+
+    try {
+      child.layoutAlign = "STRETCH";
+    } catch {
+      // Some Figma nodes do not support auto-layout child sizing.
+    }
   }
 
   const loadedFontKeys = new Set();
@@ -1729,6 +2604,26 @@ void (async function importStorybookStory(payload) {
     }
   }
 
+  function applyTextTruncation(node, styles) {
+    if (!node || !styles) return;
+
+    if (styles.maxLines !== undefined && "maxLines" in node) {
+      try {
+        node.maxLines = styles.maxLines;
+      } catch {
+        // Some Figma runtimes may not support max line limits.
+      }
+    }
+
+    if (styles.textTruncation && "textTruncation" in node) {
+      try {
+        node.textTruncation = styles.textTruncation;
+      } catch {
+        // Some Figma runtimes may not support text truncation.
+      }
+    }
+  }
+
   async function createTextNode(spec) {
     const node = figma.createText();
     const styles = spec.styles;
@@ -1737,11 +2632,33 @@ void (async function importStorybookStory(payload) {
     node.fontName = await loadTextFont(styles);
     node.characters = spec.text || "";
     node.fontSize = styles.fontSize || 14;
+    if ("textAutoResize" in node) {
+      try {
+        node.textAutoResize = "NONE";
+      } catch {
+        // Keep default text sizing if fixed text resize is not supported.
+      }
+    }
     if (styles.lineHeight && styles.lineHeight !== "normal") {
       node.lineHeight = { unit: "PIXELS", value: styles.lineHeight };
     }
     node.fills = [solidPaint(styles.color, registry.get(bindings.textColor))];
     safeResize(node, styles.width, styles.height);
+    applyTextTruncation(node, styles);
+    if (styles.textAlign && "textAlignHorizontal" in node) {
+      try {
+        node.textAlignHorizontal = mapTextAlignHorizontal(styles.textAlign);
+      } catch {
+        // Some imported text nodes may not allow text alignment changes.
+      }
+    }
+    if (styles.textAutoResize && "textAutoResize" in node) {
+      try {
+        node.textAutoResize = styles.textAutoResize;
+      } catch {
+        // Some imported text nodes may not allow auto-resize changes.
+      }
+    }
     if (
       !bindings.fontFamily ||
       (await loadBoundFontFamily(bindings.fontFamily, styles.fontWeight || 400))
@@ -1779,8 +2696,8 @@ void (async function importStorybookStory(payload) {
     return wrapper;
   }
 
-  async function createFrameNode(spec) {
-    const node = figma.createFrame();
+  async function createFrameNode(spec, context, asComponent) {
+    const node = asComponent ? figma.createComponent() : figma.createFrame();
     const styles = spec.styles;
     const bindings = spec.bindings || {};
     node.name = spec.name;
@@ -1794,12 +2711,14 @@ void (async function importStorybookStory(payload) {
     safeBind(node, "width", bindings.width);
     safeBind(node, "height", bindings.height);
     safeBind(node, "opacity", bindings.opacity);
-    safeBind(node, "strokeWeight", bindings.borderWidth);
+    if (!styles.borderSides) safeBind(node, "strokeWeight", bindings.borderWidth);
 
+    const childContext = { ...(context || {}), isRoot: false };
     for (const childSpec of spec.children || []) {
-      const child = await createNode(childSpec);
+      const child = await createNode(childSpec, childContext);
       await loadNodeFonts(child);
       node.appendChild(child);
+      applyAutoLayoutChildSizing(node, child, childSpec);
       positionChildNode(node, child, childSpec);
     }
 
@@ -1810,13 +2729,64 @@ void (async function importStorybookStory(payload) {
     return node;
   }
 
-  async function createNode(spec) {
+  async function ensureComponentDefinition(spec, component, context) {
+    const existing = findLocalComponent(component);
+    if (existing) {
+      if (context?.updateExistingComponent !== false) {
+        await updateExistingComponentDefinition(existing, spec);
+        tagComponentNode(existing, component);
+        moveExistingComponentDefinitionToTargetPage(existing);
+      }
+      return existing;
+    }
+
+    const componentNode =
+      (spec.kind === "image" || spec.kind === "svg") && spec.svgText
+        ? figma.createComponentFromNode(createSvgSceneNode(spec))
+        : await createFrameNode(
+            spec,
+            { ...(context || {}), reuseComponents: true },
+            true,
+          );
+    componentNode.name = getComponentDisplayName(component);
+    tagComponentNode(componentNode, component);
+    parkComponentDefinition(componentNode);
+    componentRegistry.set(component.key, componentNode);
+    return componentNode;
+  }
+
+  async function createComponentInstance(spec, context) {
+    const component = await ensureComponentDefinition(
+      spec,
+      spec.component,
+      { ...(context || {}), updateExistingComponent: false },
+    );
+    const instance = component.createInstance();
+    instance.name = spec.component.name;
+    safeResize(instance, spec.styles.width, spec.styles.height);
+    instance.x = spec.styles.x || 0;
+    instance.y = spec.styles.y || 0;
+    await applyInstanceOverrides(instance, spec);
+    return instance;
+  }
+
+  async function createNode(spec, context) {
+    const importContext = context || {};
+    if (
+      importContext.reuseComponents &&
+      !importContext.isRoot &&
+      spec.component?.key &&
+      canCreateComponentDefinition(spec)
+    ) {
+      return createComponentInstance(spec, importContext);
+    }
+
     const node =
       spec.kind === "text"
         ? await createTextNode(spec)
         : spec.kind === "image" || spec.kind === "svg"
           ? await createImageNode(spec)
-          : await createFrameNode(spec);
+          : await createFrameNode(spec, importContext, false);
 
     node.x = spec.styles.x || 0;
     node.y = spec.styles.y || 0;
@@ -1824,14 +2794,49 @@ void (async function importStorybookStory(payload) {
   }
 
   await upsertVariables(payload.tokens || []);
-  const rootNode = await createNode(payload.root);
-  rootNode.name = payload.componentTitle + " / " + payload.storyName;
+  const shouldImportAsComponent = payload.artifactKind === "component";
+  const rootComponent = payload.component || payload.root?.component;
+  const componentVariantSpecs =
+    shouldImportAsComponent && !rootComponent
+      ? collectComponentDefinitionSpecs(payload.root, payload.componentTitle)
+      : [];
+  const pageComponentSpecs =
+    payload.artifactKind === "page"
+      ? collectPageComponentDefinitionSpecs(payload.root)
+      : [];
+  for (const spec of pageComponentSpecs) {
+    await ensureComponentDefinition(spec, spec.component, {
+      reuseComponents: true,
+    });
+  }
+
+  const rootNode =
+    shouldImportAsComponent && rootComponent && canCreateComponentDefinition(payload.root)
+      ? await ensureComponentDefinition(
+          payload.root,
+          rootComponent,
+          { reuseComponents: true },
+        )
+      : componentVariantSpecs.length > 1
+        ? await importComponentVariantSet(componentVariantSpecs)
+      : await createNode(payload.root, {
+          isRoot: true,
+          reuseComponents: payload.artifactKind === "page",
+        });
+
+  rootNode.name = shouldImportAsComponent && rootComponent
+    ? getComponentDisplayName(rootComponent)
+    : componentVariantSpecs.length > 1
+      ? payload.componentTitle
+    : payload.componentTitle + " / " + payload.storyName;
+  rootNode.x = 0;
+  rootNode.y = 0;
   await loadNodeFonts(rootNode);
-  figma.currentPage.appendChild(rootNode);
+  if (!rootNode.parent) figma.currentPage.appendChild(rootNode);
   figma.viewport.scrollAndZoomIntoView([rootNode]);
 
   figma.notify(
-    "Imported " + payload.componentTitle + " with " +
+    "Imported " + (payload.artifactKind || "story") + " " + payload.componentTitle + " with " +
       (payload.tokens || []).length + " variables checked.",
   );
 })(STORYBOOK_FIGMA_EXPORT).catch((error) => {
@@ -1876,6 +2881,97 @@ async function copyText(text) {
     throw new Error("Clipboard copy failed.");
   }
 }
+function escapeXml(value) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function escapeSvgAttribute2(value) {
+  return escapeXml(value).replace(/"/g, "&quot;");
+}
+function formatSvgNumber(value) {
+  const numberValue = Number.isFinite(value) ? Number(value) : 0;
+  return Number.isInteger(numberValue) ? String(numberValue) : numberValue.toFixed(2);
+}
+function svgDataUrl(svgText) {
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgText)}`;
+}
+function getSvgPaint(value, fallback = "none") {
+  return value ? escapeSvgAttribute2(value) : fallback;
+}
+function renderSvgImageNode(node, isRoot) {
+  const { height, width, x, y } = node.styles;
+  const transform = isRoot ? "" : ` transform="translate(${formatSvgNumber(x)} ${formatSvgNumber(y)})"`;
+  if (!node.svgText) {
+    return "";
+  }
+  return `<g${transform}><image href="${escapeSvgAttribute2(svgDataUrl(node.svgText))}" width="${formatSvgNumber(width)}" height="${formatSvgNumber(height)}" preserveAspectRatio="none"/></g>`;
+}
+function renderSvgTextNode(node, isRoot) {
+  const { color, fontFamily, fontSize, fontWeight, height, textAlign, textAlignVertical, width, x, y } = node.styles;
+  const transform = isRoot ? "" : ` transform="translate(${formatSvgNumber(x)} ${formatSvgNumber(y)})"`;
+  const resolvedFontSize = fontSize ?? 12;
+  const textAnchor = textAlign === "center" ? "middle" : textAlign === "right" ? "end" : "start";
+  const textX = textAnchor === "middle" ? width / 2 : textAnchor === "end" ? width : 0;
+  const isCentered = textAlignVertical === "CENTER";
+  const textY = isCentered ? height / 2 : resolvedFontSize;
+  const baseline = isCentered ? "middle" : "alphabetic";
+  return `<text${transform} x="${formatSvgNumber(textX)}" y="${formatSvgNumber(textY)}" fill="${getSvgPaint(color, "#000000")}" font-family="${escapeSvgAttribute2(fontFamily ?? "sans-serif")}" font-size="${formatSvgNumber(resolvedFontSize)}" font-weight="${escapeSvgAttribute2(String(fontWeight ?? 400))}" text-anchor="${textAnchor}" dominant-baseline="${baseline}">${escapeXml(node.text ?? "")}</text>`;
+}
+function renderSvgFrameNode(node, isRoot) {
+  const {
+    backgroundColor,
+    borderColor,
+    borderWidth,
+    height,
+    opacity,
+    radius,
+    width,
+    x,
+    y
+  } = node.styles;
+  const transform = isRoot ? "" : ` transform="translate(${formatSvgNumber(x)} ${formatSvgNumber(y)})"`;
+  const groupOpacity = typeof opacity === "number" && opacity >= 0 && opacity < 1 ? ` opacity="${formatSvgNumber(opacity)}"` : "";
+  const hasRect = Boolean(backgroundColor || borderColor && borderWidth);
+  const rect = hasRect ? `<rect width="${formatSvgNumber(width)}" height="${formatSvgNumber(height)}" rx="${formatSvgNumber(radius)}" fill="${getSvgPaint(backgroundColor)}"${borderColor && borderWidth ? ` stroke="${getSvgPaint(borderColor)}" stroke-width="${formatSvgNumber(borderWidth)}"` : ""}/>` : "";
+  const children = node.children.map((child) => renderSvgNode(child)).join("");
+  return `<g${transform}${groupOpacity}>${rect}${children}</g>`;
+}
+function renderSvgNode(node, isRoot = false) {
+  if (node.kind === "text") return renderSvgTextNode(node, isRoot);
+  if (node.kind === "image" || node.kind === "svg") {
+    return renderSvgImageNode(node, isRoot);
+  }
+  return renderSvgFrameNode(node, isRoot);
+}
+function createFigmaDesignSvg(payload) {
+  const width = Math.max(1, payload.root.styles.width);
+  const height = Math.max(1, payload.root.styles.height);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${formatSvgNumber(width)}" height="${formatSvgNumber(height)}" viewBox="0 0 ${formatSvgNumber(width)} ${formatSvgNumber(height)}" role="img" aria-label="${escapeSvgAttribute2(payload.root.name)}">${renderSvgNode(payload.root, true)}</svg>`;
+}
+async function copySvgDesign(svgText) {
+  if (navigator.clipboard?.write && typeof ClipboardItem !== "undefined") {
+    const plainText = new Blob([svgText], { type: "text/plain" });
+    const htmlText = new Blob([svgText], { type: "text/html" });
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "image/svg+xml": new Blob([svgText], { type: "image/svg+xml" }),
+          "text/html": htmlText,
+          "text/plain": plainText
+        })
+      ]);
+      return;
+    } catch {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/html": htmlText,
+          "text/plain": plainText
+        })
+      ]);
+      return;
+    }
+  }
+  await copyText(svgText);
+}
 function FigmaCodeExporter({
   children,
   context,
@@ -1896,21 +2992,28 @@ function FigmaCodeExporter({
     setActiveFormat(format);
     setCopiedFormat(void 0);
     setStatus("copying");
-    setSummary(format === "json" ? "Generating JSON payload..." : "Generating console script...");
+    setSummary(
+      format === "design" ? "Generating SVG design..." : format === "json" ? "Generating JSON payload..." : "Generating console script..."
+    );
     try {
       const payload = await createFigmaExportPayload({
         componentTitle,
         options: resolvedOptions,
         scope,
         storyId: context.id ?? "unknown-story",
-        storyName: context.name ?? "Story"
+        storyName: context.name ?? "Story",
+        storyTitle: context.title ?? ""
       });
-      const exportText = format === "json" ? createFigmaExportJson(payload) : createFigmaPluginCode(payload);
-      await copyText(exportText);
+      if (format === "design") {
+        await copySvgDesign(createFigmaDesignSvg(payload));
+      } else {
+        const exportText = format === "json" ? createFigmaExportJson(payload) : createFigmaPluginCode(payload);
+        await copyText(exportText);
+      }
       setCopiedFormat(format);
       setStatus("copied");
       setSummary(
-        format === "json" ? `${payload.tokens.length} variables exported from ${payload.root.name}; JSON copied for importer.` : `${payload.tokens.length} variables exported from ${payload.root.name}; script copied for plugin console only.`
+        format === "design" ? `Visual SVG copied from ${payload.root.name}; paste into Figma for quick review.` : format === "json" ? `${payload.tokens.length} variables exported from ${payload.root.name}; ${payload.artifactKind} JSON copied for importer.` : `${payload.tokens.length} variables exported from ${payload.root.name}; ${payload.artifactKind} script copied for plugin console only.`
       );
     } catch (error) {
       setStatus("error");
@@ -1975,6 +3078,20 @@ function FigmaCodeExporter({
                   copiedFormat === "script" && status === "copied" ? /* @__PURE__ */ jsx(CheckIcon, { size: 14 }) : /* @__PURE__ */ jsx(CommandIcon, { size: 14 }),
                   activeFormat === "script" ? "Copying" : copiedFormat === "script" && status === "copied" ? "Copied" : "Plugin Console Script"
                 ]
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                "aria-label": "Copy design to Figma",
+                className: "sbfx-exporter__button sbfx-exporter__button--secondary sbfx-exporter__button--icon",
+                disabled: status === "copying",
+                onClick: () => {
+                  void handleCopy("design");
+                },
+                title: "Copy design to Figma",
+                type: "button",
+                children: copiedFormat === "design" && status === "copied" ? /* @__PURE__ */ jsx(CheckIcon, { size: 14 }) : /* @__PURE__ */ jsx(FigmaIcon, { size: 14 })
               }
             )
           ] })
