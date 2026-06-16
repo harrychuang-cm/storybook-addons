@@ -1,0 +1,74 @@
+{
+  "name": "@harrychuang/storybook-addon-prototype-inspector",
+  "version": "0.1.0",
+  "description": "Inspect prototype PRDs, UI specs, fixture data, and UI flows from Storybook story parameters",
+  "type": "module",
+  "license": "MIT",
+  "author": "Harry Chuang",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/harrychuang/storybook-addons.git",
+    "directory": "packages/prototype-inspector"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": [
+    "./dist/manager.js",
+    "./dist/preview.js",
+    "./dist/prototype-inspector.css",
+    "@xyflow/react/dist/style.css"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./preset": {
+      "types": "./dist/preset.d.ts",
+      "default": "./dist/preset.js"
+    },
+    "./preview": {
+      "types": "./dist/preview.d.ts",
+      "default": "./dist/preview.js"
+    },
+    "./manager": {
+      "types": "./dist/manager.d.ts",
+      "default": "./dist/manager.js"
+    },
+    "./styles.css": "./dist/prototype-inspector.css",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "@storybook/icons": "^1.0.0",
+    "@xyflow/react": "^12.0.0",
+    "react": "^18.0.0 || ^19.0.0",
+    "react-dom": "^18.0.0 || ^19.0.0",
+    "storybook": "^10.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react-dom": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@storybook/icons": "^1.4.0",
+    "@types/node": "^22.15.29",
+    "@types/react": "^19.1.8",
+    "@xyflow/react": "^12.11.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "storybook": "^10.0.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.3"
+  },
+  "storybook": {
+    "displayName": "Prototype Inspector",
+    "unsupportedFrameworks": []
+  }
+}
