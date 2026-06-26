@@ -39,6 +39,19 @@ type FigmaExportLinearGradient = {
     angle: number;
     stops: FigmaExportGradientStop[];
 };
+type FigmaExportGradient = {
+    angle: number;
+    stops: FigmaExportGradientStop[];
+    type: "radial" | "angular";
+};
+type FigmaExportShadow = {
+    blur: number;
+    color: string;
+    offsetX: number;
+    offsetY: number;
+    spread: number;
+    type: "drop" | "inner";
+};
 type FigmaNodeConstraint = "CENTER" | "MAX" | "MIN" | "SCALE" | "STRETCH";
 type FigmaNodeConstraints = {
     horizontal: FigmaNodeConstraint;
@@ -59,30 +72,40 @@ type FigmaExportNode = {
     name: string;
     svgText?: string;
     text?: string;
+    imageBytes?: string;
     styles: {
         alignItems?: string;
+        backgroundBlur?: number;
         backgroundColor?: string;
+        backgroundGradient?: FigmaExportGradient;
         backgroundLinearGradient?: FigmaExportLinearGradient;
         borderColor?: string;
         borderSides?: FigmaExportBorderSides;
         borderWidth?: number;
+        boxShadow?: FigmaExportShadow[];
         color?: string;
         constraints?: FigmaNodeConstraints;
+        counterAxisSpacing?: number;
         display?: string;
         flexDirection?: string;
         fontFamily?: string;
         fontSize?: number;
+        fontStyle?: "italic";
         fontWeight?: number;
         gap?: number;
         height: number;
         justifyContent?: string;
+        layerBlur?: number;
         layoutAlign?: "STRETCH";
         layoutGrow?: number;
         layoutSizingHorizontal?: "HUG";
         layoutSizingVertical?: "HUG";
+        layoutWrap?: "WRAP";
+        letterSpacing?: number;
         lineHeight?: number | "normal";
         maxLines?: number;
         textTruncation?: "ENDING";
+        objectFit?: string;
         opacity?: number;
         outOfFlow?: boolean;
         overflow?: string;
@@ -94,6 +117,7 @@ type FigmaExportNode = {
         textAlign?: string;
         textAlignVertical?: "CENTER";
         textAutoResize?: "WIDTH_AND_HEIGHT";
+        textDecoration?: "UNDERLINE" | "STRIKETHROUGH";
         width: number;
         x: number;
         y: number;
